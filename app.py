@@ -26,7 +26,15 @@ def auth(fn):
 @app.get("/")
 def index(): return send_file("index.html")
 @app.get("/health")
-def health(): return jsonify(ok=True)
+def health():
+    if not os.environ.get("DATABASE_URL"): return jsonify(ok=False,database="not_configured"),503
+    try:
+        with db() as (c,p):
+            c.execute("SELECT 1 FROM expenses LIMIT 1").fetchall()
+            c.execute("SELECT 1 FROM incomes LIMIT 1").fetchall()
+        return jsonify(ok=True,database="postgresql")
+    except Exception:
+        return jsonify(ok=False,database="unavailable"),503
 @app.post("/api/login")
 def login():
     body=request.get_json() or {}
