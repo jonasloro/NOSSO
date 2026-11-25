@@ -22,7 +22,7 @@ def database_error(error):
 def auth(fn):
     @wraps(fn)
     def wrapped(*a,**kw):
-        if not session.get("user"): return jsonify(error="Login necessário"),401
+        if session.get("user") not in ("Jhonatan","Ari"): return jsonify(error="Login necessário"),401
         if request.method not in ("GET","HEAD") and request.headers.get("X-Nosso")!="1": return jsonify(error="Requisição inválida"),403
         return fn(*a,**kw)
     return wrapped
@@ -44,6 +44,64 @@ def snapshot():
         incomes = [json.loads(r[0]) for r in c.execute("SELECT payload FROM public.incomes ORDER BY id").fetchall()]
     return jsonify(expenses=expenses, incomes=incomes)
 
+def other_user():
+    return "Ari" if session["user"] == "Jhonatan" else "Jhonatan"
+
+def brl(cents):
+    return "R$ " + f"{cents//100:,}".replace(",", ".") + "," + f"{cents%100:02d}"
+
+def notify(c, kind, title, body):
+    c.execute("INSERT INTO public.notifications(recipient,sender,kind,title,body) VALUES (%s,%s,%s,%s,%s)",
+              (other_user(),session["user"],kind,title,body))
+
+def expense_text(e):
+    return f'{e["description"]} · {brl(e["cents"])} · {e["platform"]} · {e["date"]}'
+
+def income_text(e):
+    return f'{e["description"]} · {brl(e["cents"])} · {e["date"]}'
+
+@app.get("/api/notifications")
+@auth
+def notifications():
+    from datetime import date
+    now = date.fromisoformat(payment_day())
+    with db() as (c,p):
+        rows = c.execute("SELECT payload FROM public.expenses WHERE (payload::jsonb->>'status') IS DISTINCT FROM 'Pago' AND left(payload::jsonb->>'date',7)=%s",(now.strftime("%Y-%m"),)).fetchall()
+        pending = sum(json.loads(r[0])["cents"] for r in rows)
+        if pending and now.day >= 7:
+            phase = "near" if now.day < 10 else "today" if now.day == 10 else "after"
+            title = {"near":"Dia 10 está chegando","today":"Dia 10: confira as contas","after":"Confira as contas pendentes"}[phase]
+            c.execute("INSERT INTO public.notifications(recipient,sender,kind,title,body,dedup_key) VALUES (%s,'NOSSO','reminder',%s,%s,%s) ON CONFLICT(recipient,dedup_key) DO NOTHING",
+                (session["user"],title,brl(pending)+" ainda em aberto no mês. Dia 10 é a referência habitual, não um vencimento confirmado.",now.strftime("%Y-%m")+":"+phase))
+        items = c.execute("SELECT id::text,sender,kind,title,body,created_at,read_at FROM public.notifications WHERE recipient=%s ORDER BY created_at DESC,id DESC LIMIT 100",(session["user"],)).fetchall()
+        unread = c.execute("SELECT count(*) FROM public.notifications WHERE recipient=%s AND read_at IS NULL",(session["user"],)).fetchone()[0]
+    return jsonify(items=[dict(zip(("id","sender","kind","title","body","created_at","read_at"),(r[0],r[1],r[2],r[3],r[4],r[5].isoformat(),r[6].isoformat() if r[6] else None))) for r in items],unread=unread,recipient=other_user())
+
+@app.post("/api/notifications/message")
+@auth
+def send_message():
+    body = request.get_json(silent=True)
+    if not isinstance(body,dict) or not isinstance(body.get("message"),str) or not 1<=len(body["message"].strip())<=500:
+        return jsonify(error="Escreva uma mensagem de até 500 caracteres"),400
+    with db() as (c,p):
+        notify(c,"message","Mensagem para você",body["message"].strip())
+    return jsonify(ok=True)
+
+@app.post("/api/notifications/read")
+@auth
+def mark_notifications_read():
+    body = request.get_json(silent=True)
+    if not isinstance(body,dict):
+        return jsonify(error="Dados inválidos"),400
+    with db() as (c,p):
+        if body.get("all") is True:
+            c.execute("UPDATE public.notifications SET read_at=now() WHERE recipient=%s AND read_at IS NULL",(session["user"],))
+        elif isinstance(body.get("id"),str) and len(body["id"])==36:
+            c.execute("UPDATE public.notifications SET read_at=now() WHERE recipient=%s AND id::text=%s AND read_at IS NULL",(session["user"],body["id"]))
+        else:
+            return jsonify(error="Dados inválidos"),400
+    return jsonify(ok=True)
+
 @app.get("/health")
 def health():
     if not os.environ.get("DATABASE_URL"): return jsonify(ok=False,database="not_configured"),503
@@ -51,6 +109,7 @@ def health():
         with db() as (c,p):
             c.execute("SELECT 1 FROM public.expenses LIMIT 1").fetchall()
             c.execute("SELECT 1 FROM public.incomes LIMIT 1").fetchall()
+            c.execute("SELECT 1 FROM public.notifications LIMIT 1").fetchall()
         return jsonify(ok=True,database="postgresql")
     except Exception:
         return jsonify(ok=False,database="unavailable"),503
@@ -97,6 +156,8 @@ def save():
         e["status"] = status
         e["paid_at"] = (previous.get("paid_at") or payment_day()) if status == "Pago" else None
         c.execute("INSERT INTO public.expenses (id,payload) VALUES (%s,%s) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",(e["id"],json.dumps(e)))
+        if previous != e:
+            notify(c,"expense","Despesa alterada" if old else "Nova despesa",expense_text(e)+" · "+status)
     return jsonify(ok=True)
 
 def payment_day():
@@ -122,16 +183,21 @@ def change_payment():
         records = [(i,json.loads(payload)) for i,payload in rows]
         if len({bill_key(e) for _,e in records}) != 1:
             return jsonify(error="Selecione despesas da mesma conta e mês"),400
+        changed = [e for _,e in records if e.get("status","Pendente") != status]
         for i,e in records:
             e["status"] = status
             e["paid_at"] = (e.get("paid_at") or payment_day()) if status == "Pago" else None
             c.execute("UPDATE public.expenses SET payload=%s WHERE id=%s",(json.dumps(e),i))
+        if changed:
+            notify(c,"payment","Conta paga" if status == "Pago" else "Pagamento desfeito",changed[0]["platform"]+" · "+brl(sum(e["cents"] for e in changed))+" · "+changed[0]["date"][:7])
     return jsonify(ok=True,count=len(ids))
 
 @app.delete("/api/expenses/<id>")
 @auth
 def delete(id):
-    with db() as (c,p): c.execute(f"DELETE FROM public.expenses WHERE id={p}",(id,))
+    with db() as (c,p):
+        row = c.execute("DELETE FROM public.expenses WHERE id=%s RETURNING payload",(id,)).fetchone()
+        if row: notify(c,"expense","Despesa excluída",expense_text(json.loads(row[0])))
     return jsonify(ok=True)
 
 @app.get("/api/incomes")
@@ -153,10 +219,18 @@ def save_income():
         assert isinstance(e["description"],str) and 0<len(e["description"].strip())<=200
         datetime.date.fromisoformat(e["date"])
     except (AssertionError,KeyError,TypeError,ValueError): return jsonify(error="Dados inválidos"),400
-    with db() as (c,p): c.execute(f"INSERT INTO public.incomes (id,payload) VALUES ({p},{p}) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",(e["id"],json.dumps(e)))
+    with db() as (c,p):
+        row = c.execute("SELECT payload FROM public.incomes WHERE id=%s FOR UPDATE",(e["id"],)).fetchone()
+        previous = json.loads(row[0]) if row else {}
+        c.execute("INSERT INTO public.incomes (id,payload) VALUES (%s,%s) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",(e["id"],json.dumps(e)))
+        if previous != e:
+            title = "Dinheiro recebido" if e["status"]=="Recebida" and previous.get("status")!="Recebida" else "Receita alterada" if row else "Nova receita prevista"
+            notify(c,"income",title,income_text(e)+" · "+e["status"])
     return jsonify(ok=True)
 @app.delete("/api/incomes/<id>")
 @auth
 def delete_income(id):
-    with db() as (c,p): c.execute(f"DELETE FROM public.incomes WHERE id={p}",(id,))
+    with db() as (c,p):
+        row = c.execute("DELETE FROM public.incomes WHERE id=%s RETURNING payload",(id,)).fetchone()
+        if row: notify(c,"income","Receita excluída",income_text(json.loads(row[0])))
     return jsonify(ok=True)
