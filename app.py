@@ -1,4 +1,6 @@
 import os, secrets, hmac, json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, send_file, session
 from functools import wraps
 from contextlib import contextmanager
@@ -86,8 +88,46 @@ def save():
         for k in ("description","category","type","platform"):
             assert isinstance(e[k],str) and 0<len(e[k].strip())<=200
     except (AssertionError,KeyError,TypeError,ValueError): return jsonify(error="Dados inválidos"),400
-    with db() as (c,p): c.execute(f"INSERT INTO public.expenses (id,payload) VALUES ({p},{p}) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",(e["id"],json.dumps(e)))
+    status = e.get("status", "Pendente")
+    if status not in ("Pendente", "Pago"):
+        return jsonify(error="Situação de pagamento inválida"),400
+    with db() as (c,p):
+        old = c.execute("SELECT payload FROM public.expenses WHERE id=%s FOR UPDATE", (e["id"],)).fetchone()
+        previous = json.loads(old[0]) if old else {}
+        e["status"] = status
+        e["paid_at"] = (previous.get("paid_at") or payment_day()) if status == "Pago" else None
+        c.execute("INSERT INTO public.expenses (id,payload) VALUES (%s,%s) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",(e["id"],json.dumps(e)))
     return jsonify(ok=True)
+
+def payment_day():
+    return datetime.now(ZoneInfo("America/Sao_Paulo")).date().isoformat()
+
+def bill_key(e):
+    return (e["person"], e["platform"].strip().lower(), e["type"], e["date"][:7])
+
+@app.post("/api/expenses/payment")
+@auth
+def change_payment():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="Dados inválidos"),400
+    ids, status = body.get("ids"), body.get("status")
+    if not isinstance(ids,list) or not 1 <= len(ids) <= 1000 or not all(isinstance(i,str) and 0<len(i)<=100 for i in ids) or status not in ("Pago","Pendente"):
+        return jsonify(error="Dados inválidos"),400
+    ids = sorted(set(ids))
+    with db() as (c,p):
+        rows = c.execute("SELECT id,payload FROM public.expenses WHERE id=ANY(%s) ORDER BY id FOR UPDATE",(ids,)).fetchall()
+        if len(rows) != len(ids):
+            return jsonify(error="Algum lançamento não existe mais. Atualize os dados."),409
+        records = [(i,json.loads(payload)) for i,payload in rows]
+        if len({bill_key(e) for _,e in records}) != 1:
+            return jsonify(error="Selecione despesas da mesma conta e mês"),400
+        for i,e in records:
+            e["status"] = status
+            e["paid_at"] = (e.get("paid_at") or payment_day()) if status == "Pago" else None
+            c.execute("UPDATE public.expenses SET payload=%s WHERE id=%s",(json.dumps(e),i))
+    return jsonify(ok=True,count=len(ids))
+
 @app.delete("/api/expenses/<id>")
 @auth
 def delete(id):
