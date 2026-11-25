@@ -12,6 +12,7 @@ def db():
     conn=psycopg.connect(url) if url else sqlite3.connect("/tmp/nosso.db")
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS expenses (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS incomes (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
         yield conn, "%s" if url else "?"
         conn.commit()
     finally: conn.close()
@@ -66,4 +67,31 @@ def save():
 @auth
 def delete(id):
     with db() as (c,p): c.execute(f"DELETE FROM expenses WHERE id={p}",(id,))
+    return jsonify(ok=True)
+
+@app.get("/api/incomes")
+@auth
+def incomes():
+    import json
+    with db() as (c,p): return jsonify([json.loads(r[0]) for r in c.execute("SELECT payload FROM incomes").fetchall()])
+@app.put("/api/incomes")
+@auth
+def save_income():
+    import json, datetime
+    e=request.get_json()
+    try:
+        assert isinstance(e,dict)
+        assert isinstance(e["id"],str) and 0<len(e["id"])<=100
+        assert type(e["cents"]) is int and 0<e["cents"]<=100000000000
+        assert e["person"] in ("Jhonatan","Ari","Casa")
+        assert e["status"] in ("Prevista","Recebida")
+        assert isinstance(e["description"],str) and 0<len(e["description"].strip())<=200
+        datetime.date.fromisoformat(e["date"])
+    except (AssertionError,KeyError,TypeError,ValueError): return jsonify(error="Dados inválidos"),400
+    with db() as (c,p): c.execute(f"INSERT INTO incomes (id,payload) VALUES ({p},{p}) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",(e["id"],json.dumps(e)))
+    return jsonify(ok=True)
+@app.delete("/api/incomes/<id>")
+@auth
+def delete_income(id):
+    with db() as (c,p): c.execute(f"DELETE FROM incomes WHERE id={p}",(id,))
     return jsonify(ok=True)
