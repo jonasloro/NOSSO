@@ -1,4 +1,4 @@
-import os, secrets, hmac, sqlite3
+import os, secrets, hmac
 from flask import Flask, request, jsonify, send_file, session
 from functools import wraps
 from contextlib import contextmanager
@@ -9,13 +9,14 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SECURE=True,SESSIO
 @contextmanager
 def db():
     url=os.environ.get("DATABASE_URL")
-    conn=psycopg.connect(url) if url else sqlite3.connect("/tmp/nosso.db")
-    try:
-        conn.execute("CREATE TABLE IF NOT EXISTS expenses (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS incomes (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
-        yield conn, "%s" if url else "?"
-        conn.commit()
-    finally: conn.close()
+    if not url:
+        raise psycopg.OperationalError("Database not configured")
+    with psycopg.connect(url, connect_timeout=10, sslmode="require") as conn:
+        yield conn, "%s"
+@app.errorhandler(psycopg.Error)
+def database_error(error):
+    app.logger.warning("Database operation failed: %s", type(error).__name__)
+    return jsonify(error="Banco temporariamente indisponível"),503
 def auth(fn):
     @wraps(fn)
     def wrapped(*a,**kw):
